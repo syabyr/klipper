@@ -52,7 +52,7 @@ config MACH_SAME70
     bool
 config HAVE_SAM_CANBUS
     bool
-    default y if MACH_SAME70
+    default y if MACH_SAME70 || MACH_SAM4E
 
 config MCU
     string
@@ -121,7 +121,11 @@ choice
         bool "Serial"
         select SERIAL
     config ATSAM_MMENU_CANBUS_PC12_PD12
-        bool "CAN bus (on PC12/PD12)"
+        bool "CAN bus (on PC12/PD12)" if MACH_SAME70
+        depends on HAVE_SAM_CANBUS
+        select CANSERIAL
+    config ATSAM_MMENU_CANBUS_PC12_PC15
+        bool "CAN bus (on PC12/PC15)" if MACH_SAM4E
         depends on HAVE_SAM_CANBUS
         select CANSERIAL
     config ATSAM_MMENU_CANBUS_PB3_PB2
@@ -136,7 +140,9 @@ endchoice
 choice
     prompt "CAN bus interface" if USBCANBUS
     config ATSAM_CMENU_CANBUS_PC12_PD12
-        bool "CAN bus (on PC12/PD12)"
+        bool "CAN bus (on PC12/PD12)" if MACH_SAME70
+    config ATSAM_CMENU_CANBUS_PC12_PC15
+        bool "CAN bus (on PC12/PC15)" if MACH_SAM4E
     config ATSAM_CMENU_CANBUS_PB3_PB2
         bool "CAN bus (on PB3/PB2)"
 endchoice
@@ -144,6 +150,9 @@ endchoice
 config ATSAM_CANBUS_PC12_PD12
     bool
     default y if ATSAM_MMENU_CANBUS_PC12_PD12 || ATSAM_CMENU_CANBUS_PC12_PD12
+config ATSAM_CANBUS_PC12_PC15
+    bool
+    default y if ATSAM_MMENU_CANBUS_PC12_PC15 || ATSAM_CMENU_CANBUS_PC12_PC15
 config ATSAM_CANBUS_PB3_PB2
     bool
     default y if ATSAM_MMENU_CANBUS_PB3_PB2 || ATSAM_CMENU_CANBUS_PB3_PB2
