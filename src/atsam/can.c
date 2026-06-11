@@ -13,6 +13,7 @@
 #include "internal.h" // enable_pclock
 #include "sched.h" // DECL_INIT
 
+#include <string.h> // memcpy
 #include <sam4e8e.h>
 
 /****************************************************************
@@ -60,7 +61,6 @@ void
 canhw_get_status(struct canbus_status *status)
 {
     irqstatus_t flag = irq_save();
-    uint32_t ecr = CANx->CAN_ECR;
     uint32_t sr = CANx->CAN_SR;
     uint32_t rx_error = CAN_Errors.rx_error, tx_error = CAN_Errors.tx_error;
     irq_restore(flag);
