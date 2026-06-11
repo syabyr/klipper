@@ -42,11 +42,17 @@ static const uint8_t afec_pins[] = {
 
 #if CONFIG_MACH_SAM4E
 #define AFEC1_START 16 // The first 16 pins are on afec0
+// SAM4E internal temperature sensor is hard-wired to AFEC0 channel 15.
+// It has a high source impedance (~7kOhm) and needs a long tracking time
+// to acquire correctly.  TRACKTIM is global to the AFEC, so we use the
+// maximum (15) -- the extra ~13 ADC clocks add ~2us per conversion, which
+// is negligible vs the conversion+startup overhead.
+#define AFEC0_TEMP_CHAN 15
 #define CFG_AFE_MR (AFE_MR_ANACH_ALLOWED | \
                     AFE_MR_PRESCAL(pclk / (2 * ADC_FREQ_MAX) - 1) | \
                     AFE_MR_SETTLING_AST3 | \
-                    AFE_MR_TRACKTIM(2) | \
-                    AFE_MR_TRANSFER(1) | \
+                    AFE_MR_TRACKTIM(15) | \
+                    AFE_MR_TRANSFER(2) | \
                     AFE_MR_STARTUP_SUT64)
 #define CFG_AFE_ACR AFE_ACR_IBCTL(1)
 #define CFG_AFE_IDR 0xDF00FFFF
@@ -163,6 +169,15 @@ gpio_adc_setup(uint8_t pin)
     // datasheet section 52.6.11 for SAME70
     afec->AFE_CSELR = afec_chan;
     afec->AFE_COCR = CFG_AFE_COCR;
+
+    #if CONFIG_MACH_SAM4E
+    if (pin == ADC_TEMPERATURE_PIN) {
+        // SAM4E internal temp sensor is hard-wired to AFEC0 channel 15.
+        // No external GPIO setup needed — it's an internal signal.
+        // TRACKTIM(15) in CFG_AFE_MR gives enough acquisition time
+        // for the sensor's ~7kR source impedance.
+    }
+    #endif
 
     // Enable and calibrate Channel
     afec->AFE_CHER = 1 << afec_chan;
