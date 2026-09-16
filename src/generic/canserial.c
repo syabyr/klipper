@@ -17,8 +17,6 @@
 #include "fasthash.h" // fasthash64
 #include "sched.h" // sched_wake_task
 
-#define CANBUS_UUID_LEN 6
-
 // Global storage
 static struct canbus_data {
     uint32_t assigned_id;
@@ -353,6 +351,13 @@ canserial_set_uuid(uint8_t *raw_uuid, uint32_t raw_uuid_len)
     uint64_t hash = fasthash64(raw_uuid, raw_uuid_len, 0xA16231A7);
     memcpy(CanData.uuid, &hash, sizeof(CanData.uuid));
     canserial_notify_rx();
+}
+
+// Return the 6-byte canbus uuid (for use as a USB serial number)
+uint8_t *
+canserial_get_uuid(void)
+{
+    return CanData.uuid;
 }
 
 void

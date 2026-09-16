@@ -5,11 +5,13 @@
 
 #define CANBUS_ID_ADMIN 0x3f0
 #define CANBUS_ID_ADMIN_RESP 0x3f1
+#define CANBUS_UUID_LEN 6
 
 // canserial.c
 void canserial_notify_tx(void);
 struct canbus_msg;
 void canserial_process_data(struct canbus_msg *msg);
 void canserial_set_uuid(uint8_t *raw_uuid, uint32_t raw_uuid_len);
+uint8_t *canserial_get_uuid(void);
 
 #endif // canserial.h

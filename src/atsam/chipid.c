@@ -5,7 +5,7 @@
 // This file may be distributed under the terms of the GNU GPLv3 license.
 
 #include "generic/irq.h" // irq_disable
-#include "generic/canserial.h" // canserial_set_uuid
+#include "generic/canserial.h" // canserial_set_uuid, CANBUS_UUID_LEN
 #include "generic/usb_cdc.h" // usb_fill_serial
 #include "generic/usbstd.h" // usb_string_descriptor
 #include "internal.h" // EFC0
@@ -70,10 +70,17 @@ chipid_init(void)
     read_chip_id(id);
     irq_enable();
 
-    if (CONFIG_USB_SERIAL_NUMBER_CHIPID)
-        usb_fill_serial(&cdc_chipid.desc, ARRAY_SIZE(cdc_chipid.data), id);
-
+    // Compute the canbus uuid first - it is also used as the USB serial
+    // number so the device can be identified with canbus_query.py
     if (CONFIG_CANBUS)
         canserial_set_uuid((void*)id, CHIP_UID_LEN);
+
+    if (CONFIG_USB_SERIAL_NUMBER_CHIPID) {
+        if (CONFIG_CANBUS)
+            usb_fill_serial(&cdc_chipid.desc, CANBUS_UUID_LEN * 2,
+                            canserial_get_uuid());
+        else
+            usb_fill_serial(&cdc_chipid.desc, ARRAY_SIZE(cdc_chipid.data), id);
+    }
 }
 DECL_INIT(chipid_init);

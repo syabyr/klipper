@@ -5,7 +5,6 @@
 //
 // This file may be distributed under the terms of the GNU GPLv3 license.
 
-#include "board/irq.h" // irq_save
 #include "command.h" // DECL_CONSTANT_STR
 #include "generic/armcm_boot.h" // armcm_enable_irq
 #include "generic/canbus.h" // canbus_notify_tx
@@ -52,21 +51,21 @@
 // First receive mailbox
 #define CAN_RX_MB_START 1
 
-static struct {
-    uint32_t rx_error, tx_error;
-} CAN_Errors;
+// Filter id of the last canhw_set_filter() call, saved so the bus-off
+// recovery can re-apply the mailbox configuration
+static uint32_t can_filter_id;
 
 // Report interface status
 void
 canhw_get_status(struct canbus_status *status)
 {
-    irqstatus_t flag = irq_save();
+    // Error counters are read directly from hardware - servicing them
+    // from interrupts would raise an irq storm on a bus with persistent
+    // errors (e.g. no other node to acknowledge transmissions).
+    uint32_t ecr = CANx->CAN_ECR;
+    status->rx_error = (ecr & CAN_ECR_REC_Msk) >> CAN_ECR_REC_Pos;
+    status->tx_error = (ecr & CAN_ECR_TEC_Msk) >> CAN_ECR_TEC_Pos;
     uint32_t sr = CANx->CAN_SR;
-    uint32_t rx_error = CAN_Errors.rx_error, tx_error = CAN_Errors.tx_error;
-    irq_restore(flag);
-
-    status->rx_error = rx_error;
-    status->tx_error = tx_error;
     if (sr & CAN_SR_BOFF)
         status->bus_state = CANBUS_STATE_OFF;
     else if (sr & CAN_SR_ERRP)
@@ -81,27 +80,35 @@ canhw_get_status(struct canbus_status *status)
 void
 canhw_set_filter(uint32_t id)
 {
-    // Setup acceptance filters in mailboxes
-    if (!CONFIG_CANBUS_FILTER)
+    can_filter_id = id;
+
+    if (!CONFIG_CANBUS_FILTER) {
+        // No filtering - configure all receive mailboxes to accept every
+        // message (mask 0 = all identifier bits don't care)
+        for (int mb = CAN_RX_MB_START; mb < CAN_MB_COUNT; mb++) {
+            CANx->CAN_MB[mb].CAN_MAM = 0;
+            CANx->CAN_MB[mb].CAN_MID = 0;
+            CANx->CAN_MB[mb].CAN_MMR = CAN_MMR_MOT_MB_RX;
+        }
         return;
+    }
+
+    // Setup acceptance filters in mailboxes
 
     // Filter for CANBUS_ID_ADMIN
     CANx->CAN_MB[CAN_RX_MB_START].CAN_MAM = (CANBUS_ID_ADMIN & 0x7FF) << 18;
     CANx->CAN_MB[CAN_RX_MB_START].CAN_MID = (CANBUS_ID_ADMIN & 0x7FF) << 18;
-    CANx->CAN_MB[CAN_RX_MB_START].CAN_MMR =
-        (CAN_MMR_MOT_MB_RX << CAN_MMR_MOT_Pos);
+    CANx->CAN_MB[CAN_RX_MB_START].CAN_MMR = CAN_MMR_MOT_MB_RX;
 
     // Filter for id
     CANx->CAN_MB[CAN_RX_MB_START + 1].CAN_MAM = (id & 0x7FF) << 18;
     CANx->CAN_MB[CAN_RX_MB_START + 1].CAN_MID = (id & 0x7FF) << 18;
-    CANx->CAN_MB[CAN_RX_MB_START + 1].CAN_MMR =
-        (CAN_MMR_MOT_MB_RX << CAN_MMR_MOT_Pos);
+    CANx->CAN_MB[CAN_RX_MB_START + 1].CAN_MMR = CAN_MMR_MOT_MB_RX;
 
     // Filter for id + 1
     CANx->CAN_MB[CAN_RX_MB_START + 2].CAN_MAM = ((id + 1) & 0x7FF) << 18;
     CANx->CAN_MB[CAN_RX_MB_START + 2].CAN_MID = ((id + 1) & 0x7FF) << 18;
-    CANx->CAN_MB[CAN_RX_MB_START + 2].CAN_MMR =
-        (CAN_MMR_MOT_MB_RX << CAN_MMR_MOT_Pos);
+    CANx->CAN_MB[CAN_RX_MB_START + 2].CAN_MMR = CAN_MMR_MOT_MB_RX;
 }
 
 // Transmit a packet
@@ -119,7 +126,11 @@ canhw_send(struct canbus_msg *msg)
         ids = ((msg->id & 0x1fffffff) << 0) | CAN_MID_MIDE;
     else
         ids = (msg->id & 0x7ff) << 18;
-    ids |= msg->id & CANMSG_ID_RTR ? CAN_MSR_MRTR : 0;
+
+    // Disable the mailbox while writing the identifier - the mailbox
+    // must not be in transmitter mode while CAN_MID is written (same
+    // rule the Linux at91_can driver follows in at91_start_xmit).
+    CANx->CAN_MB[CAN_TX_MB].CAN_MMR = 0;
 
     // Set ID and data
     CANx->CAN_MB[CAN_TX_MB].CAN_MID = ids;
@@ -127,12 +138,42 @@ canhw_send(struct canbus_msg *msg)
     memcpy(data, msg->data, sizeof(data));
     CANx->CAN_MB[CAN_TX_MB].CAN_MDL = data[0];
     CANx->CAN_MB[CAN_TX_MB].CAN_MDH = data[1];
-    CANx->CAN_MB[CAN_TX_MB].CAN_MCR = (msg->dlc & 0x0f) << CAN_MCR_MDLC_Pos;
 
-    // Trigger transmission
+    // Restore transmitter mode and set the data length code
+    CANx->CAN_MB[CAN_TX_MB].CAN_MMR = CAN_MMR_MOT_MB_TX;
+    uint32_t mcr = (msg->dlc & 0x0f) << CAN_MCR_MDLC_Pos;
+    if (msg->id & CANMSG_ID_RTR)
+        mcr |= CAN_MCR_MRTR;
+    CANx->CAN_MB[CAN_TX_MB].CAN_MCR = mcr;
+
+    // Trigger transmission and enable the transmit complete and bus-off
+    // interrupts.  The bus-off interrupt lets the irq handler abort a
+    // transfer that can not complete (typically because no other node
+    // is on the bus to acknowledge it) - without the abort the mailbox
+    // would stay busy forever and the higher layers would never receive
+    // a tx notification.
     CANx->CAN_TCR = 1 << CAN_TX_MB;
+    CANx->CAN_IER = (1 << CAN_TX_MB) | CAN_IER_BOFF;
 
     return CANMSG_DATA_LEN(msg);
+}
+
+// Re-enable the CAN controller after a bus-off.  The SAM4E has no
+// automatic bus-off recovery - the controller stays off the bus until
+// software disables and re-enables it.  The mailbox configuration is
+// re-applied because disabling the controller may reset it.
+static void
+can_recover_bus_off(void)
+{
+    // Abort the transfer pending in the transmit mailbox - it can not
+    // complete (nothing on the bus acknowledges it)
+    CANx->CAN_ACR = 1 << CAN_TX_MB;
+
+    // Restart the controller with the same configuration
+    CANx->CAN_MR &= ~CAN_MR_CANEN;
+    CANx->CAN_MB[CAN_TX_MB].CAN_MMR = CAN_MMR_MOT_MB_TX;
+    canhw_set_filter(can_filter_id);
+    CANx->CAN_MR |= CAN_MR_CANEN;
 }
 
 // This function handles CAN global interrupts
@@ -168,29 +209,31 @@ CAN_IRQHandler(void)
             // Process packet
             canbus_process_data(&msg);
 
-            // Clear mailbox
-            mb_ptr->CAN_MCR = 0;
+            // Release the mailbox for the next reception
+            // (MTCR clears MRDY, which clears the CAN_SR mailbox flag)
+            mb_ptr->CAN_MCR = CAN_MCR_MTCR;
         }
     }
 
     // Check for transmit complete
     if (sr & (1 << CAN_TX_MB) && (imr & (1 << CAN_TX_MB))) {
-        // Transmit done - clear status
-        CANx->CAN_MB[CAN_TX_MB].CAN_MCR = 0;
+        // Mask the interrupt until the next canhw_send() re-enables it.
+        // The CAN_SR flag must stay set - it marks the mailbox ready.
+        CANx->CAN_IDR = 1 << CAN_TX_MB;
         canbus_notify_tx();
     }
 
-    // Check for bus errors
-    if (sr & CAN_SR_CERR && (imr & CAN_IER_CERR))
-        CAN_Errors.rx_error++;
-    if (sr & CAN_SR_SERR && (imr & CAN_IER_SERR))
-        CAN_Errors.rx_error++;
-    if (sr & CAN_SR_AERR && (imr & CAN_IER_AERR))
-        CAN_Errors.rx_error++;
-    if (sr & CAN_SR_FERR && (imr & CAN_IER_FERR))
-        CAN_Errors.rx_error++;
-    if (sr & CAN_SR_BERR && (imr & CAN_IER_BERR))
-        CAN_Errors.tx_error++;
+    // Check for bus-off: the pending transfer can not complete (no node
+    // acknowledges it) and the controller does not leave the bus-off
+    // state on its own.  Recover the controller and notify the higher
+    // layers - otherwise a transfer stuck on a dead bus would block the
+    // tx path forever.
+    if (sr & CAN_SR_BOFF && (imr & CAN_IER_BOFF)) {
+        // Mask until the next canhw_send() re-arms it
+        CANx->CAN_IDR = CAN_IER_BOFF;
+        can_recover_bus_off();
+        canbus_notify_tx();
+    }
 }
 
 static inline const uint32_t
@@ -268,8 +311,11 @@ can_init(void)
     // Compute baud rate setting
     uint32_t br = compute_br(pclock, CONFIG_CANBUS_FREQUENCY);
 
-    // Enable CAN controller
-    CANx->CAN_MR = CAN_MR_CANEN;
+    // The controller must be disabled while the mailboxes are
+    // programmed - mailbox register writes are silently dropped when
+    // CANEN is set (the Linux at91_can driver for the same CAN IP
+    // configures all mailboxes before enabling the controller).
+    CANx->CAN_MR = 0;
     CANx->CAN_BR = br | CAN_BR_SMP_THREE; // Sample three times
 
     // Configure mailboxes
@@ -278,21 +324,26 @@ can_init(void)
     }
 
     // Configure transmit mailbox
-    CANx->CAN_MB[CAN_TX_MB].CAN_MMR = (CAN_MMR_MOT_MB_TX << CAN_MMR_MOT_Pos);
+    CANx->CAN_MB[CAN_TX_MB].CAN_MMR = CAN_MMR_MOT_MB_TX;
 
     // Setup filter
     canhw_set_filter(0);
 
+    // Enable the controller - this must be the last configuration step
+    CANx->CAN_MR = CAN_MR_CANEN;
+
     // Enable interrupts
     armcm_enable_irq(CAN_IRQHandler, CANx_IRQn, 1);
 
-    // Enable all error interrupts and mailbox interrupts
+    // Enable receive mailbox interrupts only.  The transmit mailbox
+    // interrupt is enabled by canhw_send() for each transfer, and bus
+    // error/state interrupts are never enabled - they would raise an
+    // interrupt storm while transmissions retry without an ack on the
+    // bus (canhw_get_status() polls the counters instead).
     uint32_t ier = 0;
-    for (int i = 0; i < CAN_MB_COUNT; i++) {
+    for (int i = CAN_RX_MB_START; i < CAN_MB_COUNT; i++) {
         ier |= 1 << i;
     }
-    ier |= CAN_IER_ERRA | CAN_IER_WARN | CAN_IER_ERRP | CAN_IER_BOFF
-        | CAN_IER_CERR | CAN_IER_SERR | CAN_IER_AERR | CAN_IER_FERR | CAN_IER_BERR;
     CANx->CAN_IER = ier;
 }
 DECL_INIT(can_init);

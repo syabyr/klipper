@@ -18,6 +18,10 @@
 #define CSR_BULK_OUT (UDP_CSR_EPTYPE_BULK_OUT | UDP_CSR_EPEDS)
 #define CSR_BULK_IN (UDP_CSR_EPTYPE_BULK_IN | UDP_CSR_EPEDS)
 
+// Ping-pong bank tracker for the bulk-out endpoint (reset when the
+// endpoints are reconfigured, e.g. after a USB reset)
+static uint32_t next_bk = UDP_CSR_RX_DATA_BK0;
+
 static void
 usb_write_packet(uint32_t ep, const uint8_t *data, uint32_t len)
 {
@@ -38,16 +42,10 @@ usb_read_packet(uint32_t ep, uint32_t csr, uint8_t *data, uint32_t max_len)
 int_fast8_t
 usb_read_bulk_out(void *data, uint_fast8_t max_len)
 {
-    static uint32_t next_bk = UDP_CSR_RX_DATA_BK0;
-    const uint32_t other_irqs = (UDP_CSR_RXSETUP | UDP_CSR_STALLSENT
-                                 | UDP_CSR_TXCOMP);
     uint32_t csr = UDP->UDP_CSR[USB_CDC_EP_BULK_OUT];
     uint32_t bk = csr & (UDP_CSR_RX_DATA_BK0 | UDP_CSR_RX_DATA_BK1);
     if (!bk) {
         // Not ready to receive data
-        if (csr & other_irqs)
-            UDP->UDP_CSR[USB_CDC_EP_BULK_OUT] = (
-                CSR_BULK_OUT | UDP_CSR_RX_DATA_BK0 | UDP_CSR_RX_DATA_BK1);
         UDP->UDP_IER = 1<<USB_CDC_EP_BULK_OUT;
         return -1;
     }
@@ -56,24 +54,48 @@ usb_read_bulk_out(void *data, uint_fast8_t max_len)
         bk = next_bk;
     next_bk = bk ^ (UDP_CSR_RX_DATA_BK0 | UDP_CSR_RX_DATA_BK1);
     UDP->UDP_CSR[USB_CDC_EP_BULK_OUT] = CSR_BULK_OUT | next_bk;
+    // A CSR write crosses into the USB clock domain and does not take
+    // effect immediately.  Wait for the consumed bank's flag to read
+    // back clear - otherwise a caller in a tight loop (e.g. the canbus
+    // bridge draining the endpoint) could see the stale flag set and
+    // read the bank again while the hardware refills it, mixing bytes
+    // of the old and the new packet.
+    while (UDP->UDP_CSR[USB_CDC_EP_BULK_OUT] & bk)
+        ;
+    // Keep the endpoint interrupt armed - usb_canbus.c does not
+    // necessarily retry after a successful read, so an un-armed
+    // interrupt would leave incoming packets unnoticed.
+    UDP->UDP_IER = 1<<USB_CDC_EP_BULK_OUT;
     return len;
 }
 
 int_fast8_t
 usb_send_bulk_in(void *data, uint_fast8_t len)
 {
-    const uint32_t other_irqs = (UDP_CSR_RXSETUP | UDP_CSR_STALLSENT
-                                 | UDP_CSR_RX_DATA_BK0 | UDP_CSR_RX_DATA_BK1);
     uint32_t csr = UDP->UDP_CSR[USB_CDC_EP_BULK_IN];
+    if (!(csr & UDP_CSR_EPEDS)) {
+        // Endpoint not configured yet (the host has not completed
+        // enumeration) - writing a packet now would set TXPKTRDY on a
+        // disabled endpoint and can wedge the endpoint state machine
+        // across the following usb bus reset / reconfiguration.
+        return -1;
+    }
     if (csr & UDP_CSR_TXPKTRDY) {
         // Not ready to send
-        if (csr & other_irqs)
-            UDP->UDP_CSR[USB_CDC_EP_BULK_IN] = CSR_BULK_IN | UDP_CSR_TXCOMP;
         UDP->UDP_IER = 1<<USB_CDC_EP_BULK_IN;
         return -1;
     }
     usb_write_packet(USB_CDC_EP_BULK_IN, data, len);
     UDP->UDP_CSR[USB_CDC_EP_BULK_IN] = CSR_BULK_IN | UDP_CSR_TXPKTRDY;
+    // Wait for the write to cross into the USB clock domain - otherwise
+    // a caller in a tight loop could still see TXPKTRDY clear, append
+    // another packet to the FIFO and corrupt the pending one.
+    while (!(UDP->UDP_CSR[USB_CDC_EP_BULK_IN] & UDP_CSR_TXPKTRDY))
+        ;
+    // Keep the endpoint interrupt armed so the transmit-complete event
+    // wakes usb_canbus.c even when it does not queue another frame
+    // right away.
+    UDP->UDP_IER = 1<<USB_CDC_EP_BULK_IN;
     return len;
 }
 
@@ -155,9 +177,24 @@ usb_set_address(uint_fast8_t addr)
 void
 usb_set_configure(void)
 {
+    // Disable the endpoints before reconfiguring.  Clearing EPEDS
+    // resets the endpoint (including any packet pending in the FIFO),
+    // which prevents stale TXPKTRDY state from wedging the endpoint
+    // state machine.
+    UDP->UDP_CSR[USB_CDC_EP_ACM] = 0;
+    UDP->UDP_CSR[USB_CDC_EP_BULK_OUT] = 0;
+    UDP->UDP_CSR[USB_CDC_EP_BULK_IN] = 0;
+    // CSR writes must be confirmed (read back) before the endpoint is
+    // reprogrammed - the write may otherwise not have taken effect yet.
+    (void)UDP->UDP_CSR[USB_CDC_EP_ACM];
+    (void)UDP->UDP_CSR[USB_CDC_EP_BULK_OUT];
+    (void)UDP->UDP_CSR[USB_CDC_EP_BULK_IN];
+
     UDP->UDP_CSR[USB_CDC_EP_ACM] = CSR_ACM;
     UDP->UDP_CSR[USB_CDC_EP_BULK_OUT] = CSR_BULK_OUT;
     UDP->UDP_CSR[USB_CDC_EP_BULK_IN] = CSR_BULK_IN;
+    // The bulk-out ping-pong bank rotation restarts at bank 0
+    next_bk = UDP_CSR_RX_DATA_BK0;
     UDP->UDP_GLB_STAT |= UDP_GLB_STAT_CONFG;
 }
 
