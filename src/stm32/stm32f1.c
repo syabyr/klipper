@@ -99,6 +99,10 @@ clock_setup(void)
         ;
 }
 
+// The stm32f103 PWR block has just two registers; the n32g45x adds a
+// third one holding the "ex mode" enable bit
+#define N32_PWR_CTRL3 (*(volatile uint32_t *)(PWR_BASE + 0x0c))
+
 // Return the RCC_CFGR bits that select the given PLL multiplier on the
 // n32g45x, whose PLLMUL field is five bits wide (PLLMUL[4] is bit 27)
 static uint32_t
@@ -115,7 +119,7 @@ n32g45x_pll_multiplier_bits(uint32_t mul)
       && (2 * CONFIG_CLOCK_FREQ) % CONFIG_CLOCK_REF_FREQ
     #error "Unable to generate the requested clock rate from this crystal"
   #endif
-  #if CONFIG_USB && CONFIG_CLOCK_FREQ != 96000000
+  #if CONFIG_USB && CONFIG_CLOCK_FREQ != 144000000
     #error "Unable to generate a 48Mhz usb clock at this system clock rate"
   #endif
 #endif
@@ -126,6 +130,14 @@ n32g45x_pll_multiplier_bits(uint32_t mul)
 static void
 clock_setup_n32g45x(void)
 {
+    // The n32g45x keeps its adc, sdio, qspi, opamp, comp and can2 behind
+    // the "ex mode" bit: while it is clear their RCC enable bits read back
+    // as zero and the peripherals stay unclocked.  The vendor SystemInit()
+    // sets it before configuring any clock, so do the same here.
+    RCC->APB1ENR |= RCC_APB1ENR_PWREN;
+    N32_PWR_CTRL3 |= 1;
+    RCC->APB1ENR &= ~RCC_APB1ENR_PWREN;
+
     // Configure and enable PLL
     uint32_t cfgr;
     if (!CONFIG_STM32_CLOCK_REF_INTERNAL) {
@@ -151,11 +163,10 @@ clock_setup_n32g45x(void)
         cfgr |= RCC_CFGR_PPRE1_DIV4 | RCC_CFGR_PPRE2_DIV4;
     else if (CONFIG_CLOCK_FREQ > 36000000)
         cfgr |= RCC_CFGR_PPRE1_DIV2 | RCC_CFGR_PPRE2_DIV2;
-    // The n32g45x usb clock is PLLCLK divided by 1.5, 1, 2 or 3.  The
-    // clock defaults select 96Mhz when usb is enabled, which produces
-    // the 48Mhz the usb peripheral needs through the /2 divisor.
-    if (CONFIG_CLOCK_FREQ == 96000000)
-        cfgr |= 2 << 22;
+    // The n32g45x usb clock is PLLCLK divided by 1.5, 1, 2 or 3 - at
+    // 144Mhz the /3 divisor produces the 48Mhz the usb peripheral needs
+    if (CONFIG_CLOCK_FREQ == 144000000)
+        cfgr |= 3 << 22;
     RCC->CFGR = cfgr;
     RCC->CR |= RCC_CR_PLLON;
 
